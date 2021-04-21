@@ -992,6 +992,11 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM,
     setTargetDAGCombine(ISD::ADD);
     setTargetDAGCombine(ISD::BITCAST);
   }
+
+  if (Subtarget->hasNEON()) {
+    setTargetDAGCombine(ISD::TRUNCATE);
+  }
+
   if (Subtarget->hasMVEIntegerOps()) {
     setTargetDAGCombine(ISD::SMIN);
     setTargetDAGCombine(ISD::UMIN);
@@ -16014,10 +16019,101 @@ static SDValue PerformFPExtendCombine(SDNode *N, SelectionDAG &DAG,
   return SDValue();
 }
 
-/// PerformMinMaxCombine - Target-specific DAG combining for creating truncating
+/// PerformNeonMinMaxCombine NEON DAG combining for creating truncating
+///// saturates.
+static SDValue PerformNeonTruncateMinMaxCombine(SDNode *N, SelectionDAG &DAG,
+                                                const ARMSubtarget *ST) {
+  EVT VT = N->getValueType(0);
+  SDValue N0 = N->getOperand(0);
+
+  if (!ST->hasNEON()) {
+    return SDValue();
+  }
+
+  if (VT != MVT::v8i8 && VT != MVT::v4i16)
+    return SDValue();
+
+  EVT VT0 = N0->getValueType(0);
+  if (!(VT == MVT::v8i8 && VT0 == MVT::v8i16) &&
+      !(VT == MVT::v4i16 && VT0 == MVT::v4i32)) {
+    return SDValue();
+  }
+
+  auto IsSignedSaturate = [&](SDNode *Min) {
+    auto *Max = N0->getOperand(0).getNode();
+
+    // Check one is a smin and the other is a smax
+    if (Min->getOpcode() != ISD::SMIN)
+      std::swap(Min, Max);
+    if (Min->getOpcode() != ISD::SMIN || Max->getOpcode() != ISD::SMAX)
+      return false;
+
+    APInt SaturateC;
+    if (VT == MVT::v8i8)
+      SaturateC = APInt(16, (1 << 7) - 1, true);
+    else // if (VT == MVT::v4i16)
+      SaturateC = APInt(32, (1 << 15) - 1, true);
+
+    APInt MinC, MaxC;
+    if (!ISD::isConstantSplatVector(Min->getOperand(1).getNode(), MinC) ||
+        MinC != SaturateC)
+      return false;
+    if (!ISD::isConstantSplatVector(Max->getOperand(1).getNode(), MaxC) ||
+        MaxC != ~SaturateC)
+      return false;
+    return true;
+  };
+
+  if (IsSignedSaturate(N0.getNode())) {
+    SDValue N00 = N0->getOperand(0);
+    //  t26: v8i8 = truncate t25
+    //    t25: v8i16 = smax t20, t22
+    //      t20: v8i16 = smin t62, t17
+    //  ----> vqmovn.s16 d0, q1
+
+    SDLoc DL(N);
+    return DAG.getNode(
+        ISD::INTRINSIC_WO_CHAIN, DL, VT,
+        DAG.getConstant(Intrinsic::arm_neon_vqmovns, DL, MVT::i32),
+        N00->getOperand(0));
+  }
+
+  auto IsUnsignedSaturate = [&](SDNode *Min) {
+    // For unsigned, we just need to check for <= 0xffff
+    if (Min->getOpcode() != ISD::UMIN)
+      return false;
+
+    APInt SaturateC;
+    if (VT == MVT::v8i8)
+      SaturateC = APInt(16, (1 << 8) - 1, true);
+    else // if (VT == MVT::v4i16)
+      SaturateC = APInt(32, (1 << 16) - 1, true);
+
+    APInt MinC;
+    if (!ISD::isConstantSplatVector(Min->getOperand(1).getNode(), MinC) ||
+        MinC != SaturateC)
+      return false;
+    return true;
+  };
+
+  if (IsUnsignedSaturate(N0.getNode())) {
+    //  t26: v8i8 = truncate t25
+    //      t20: v8i16 = umin t62, t17
+    //  ----> vqmovn.u16 d0, q1
+    SDLoc DL(N);
+    return DAG.getNode(
+        ISD::INTRINSIC_WO_CHAIN, DL, VT,
+        DAG.getConstant(Intrinsic::arm_neon_vqmovnu, DL, MVT::i32),
+        N0->getOperand(0));
+  }
+
+  return SDValue();
+}
+
+/// PerformMVEMinMaxCombine - MVE DAG combining for creating truncating
 /// saturates.
-static SDValue PerformMinMaxCombine(SDNode *N, SelectionDAG &DAG,
-                                    const ARMSubtarget *ST) {
+static SDValue PerformMVEMinMaxCombine(SDNode *N, SelectionDAG &DAG,
+                                       const ARMSubtarget *ST) {
   EVT VT = N->getValueType(0);
   SDValue N0 = N->getOperand(0);
   if (!ST->hasMVEIntegerOps())
@@ -16695,7 +16791,9 @@ SDValue ARMTargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::UMIN:
   case ISD::SMAX:
   case ISD::UMAX:
-    return PerformMinMaxCombine(N, DCI.DAG, Subtarget);
+    return PerformMVEMinMaxCombine(N, DCI.DAG, Subtarget);
+  case ISD::TRUNCATE:
+    return PerformNeonTruncateMinMaxCombine(N, DCI.DAG, Subtarget);
   case ARMISD::CMOV: return PerformCMOVCombine(N, DCI.DAG);
   case ARMISD::BRCOND: return PerformBRCONDCombine(N, DCI.DAG);
   case ISD::LOAD:       return PerformLOADCombine(N, DCI);
